@@ -1,0 +1,27 @@
+{
+  "name": "cloudnova-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CloudNova backend — holds AWS credentials server-side and makes the real AWS SDK v3 calls the frontend previously simulated.",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-auto-scaling": "^3.637.0",
+    "@aws-sdk/client-cloudtrail": "^3.637.0",
+    "@aws-sdk/client-cloudwatch": "^3.637.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.637.0",
+    "@aws-sdk/client-ec2": "^3.637.0",
+    "@aws-sdk/client-guardduty": "^3.1152.0",
+    "@aws-sdk/client-iam": "^3.637.0",
+    "@aws-sdk/client-lambda": "^3.1152.0",
+    "@aws-sdk/client-rds": "^3.637.0",
+    "@aws-sdk/client-s3": "^3.637.0",
+    "@aws-sdk/client-sts": "^3.637.0",
+    "cors": "^2.8.6",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
