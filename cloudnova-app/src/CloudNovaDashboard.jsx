@@ -2073,8 +2073,9 @@ function OperationsConsole({ form, scenarioKey, onLogout }) {
               <MetricCard icon={HardDrive} label="Memory Usage" value={fetchedData.memory} sub="fleet average" live={connection.mode === "live"} />
               <MetricCard icon={Network} label="Security Groups" value={fetchedData.securityGroups} sub="in use" live={connection.mode === "live"} />
               <MetricCard icon={Database} label="S3 Buckets" value={fetchedData.s3Buckets} sub="monitored" live={connection.mode === "live"} />
-              <MetricCard icon={Layers} label="Auto Scaling Groups" value={fetchedData.asg} sub="active" live={connection.mode === "live"} />
-              <MetricCard icon={Boxes} label="RDS Status" value={fetchedData.rds} sub="primary cluster" live={connection.mode === "live"} />
+              <MetricCard icon={Layers} label="Auto Scaling Groups" value={ Array.isArray(fetchedData.asg) ? fetchedData.asg.length : "Unavailable"} sub="discovered in AWS" live={connection.mode === "live"}/>
+
+              <MetricCard icon={Boxes} label="RDS Instances" value={ Array.isArray(fetchedData.rds) ? fetchedData.rds.length : fetchedData.rds === "No RDS instances" ? 0 : "Unavailable"} sub="discovered in AWS" live={connection.mode === "live"}/>
               <MetricCard icon={ScrollText} label="CloudWatch Logs" value={fetchedData.cwLogs} sub="last 24h" live={connection.mode === "live"} />
               <MetricCard icon={History} label="CloudTrail Events" value={fetchedData.ctEvents} sub="last 24h" live={connection.mode === "live"} />
             </div>

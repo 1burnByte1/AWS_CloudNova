@@ -616,34 +616,85 @@ try {
 }
 
     // Auto Scaling
-    try {
-      const asg = new AutoScalingClient({ region, credentials });
-      const groups = await asg.send(
-        new DescribeAutoScalingGroupsCommand({})
-      );
-      data.asg = groups.AutoScalingGroups?.length || 0;
-    } catch (err) {
-      console.error(
-        "Auto Scaling query failed:",
-        err.name || "Error"
-      );
-      data.asg = null;
-    }
+
+try {
+  const asg = new AutoScalingClient({ region, credentials });
+
+  const response = await asg.send(
+    new DescribeAutoScalingGroupsCommand({ MaxRecords: 20 })
+  );
+
+  const groups = response.AutoScalingGroups || [];
+
+  data.asg = groups.map((group) => ({
+    name: group.AutoScalingGroupName,
+    status: group.Status || "Not available",
+    minSize: group.MinSize,
+    maxSize: group.MaxSize,
+    desiredCapacity: group.DesiredCapacity,
+    currentInstances: (group.Instances || []).length,
+    healthyInstances: (group.Instances || []).filter(
+      (instance) => instance.HealthStatus === "Healthy"
+    ).length,
+    instances: (group.Instances || []).map((instance) => ({
+      instanceId: instance.InstanceId,
+      lifecycleState: instance.LifecycleState,
+      healthStatus: instance.HealthStatus,
+      availabilityZone: instance.AvailabilityZone,
+    })),
+    availabilityZones: group.AvailabilityZones || [],
+  }));
+
+  data.asgCount = groups.length;
+
+} catch (err) {
+  console.error(
+    "Auto Scaling query failed:",
+    err.name || "Error"
+  );
+
+  data.asg = null;
+  data.asgCount = null;
+  data.asgError = err.name || "UnknownError";
+}
+
 
     // RDS
-    try {
-      const rds = new RDSClient({ region, credentials });
-      const dbs = await rds.send(
-        new DescribeDBInstancesCommand({})
-      );
 
-      data.rds = dbs.DBInstances?.length
-        ? dbs.DBInstances[0].DBInstanceStatus
-        : "No RDS instances";
-    } catch (err) {
-      console.error("RDS query failed:", err.name || "Error");
-      data.rds = "Unavailable";
-    }
+try {
+  const rds = new RDSClient({ region, credentials });
+
+  const response = await rds.send(
+    new DescribeDBInstancesCommand({ MaxRecords: 20 })
+  );
+
+  const dbInstances = response.DBInstances || [];
+
+  data.rds = dbInstances.length
+    ? dbInstances.map((db) => ({
+        identifier: db.DBInstanceIdentifier,
+        status: db.DBInstanceStatus,
+        engine: db.Engine,
+        engineVersion: db.EngineVersion,
+        instanceClass: db.DBInstanceClass,
+        availabilityZone: db.AvailabilityZone,
+        publiclyAccessible: db.PubliclyAccessible,
+        endpoint: db.Endpoint?.Address || "Not available",
+        allocatedStorageGB: db.AllocatedStorage,
+        multiAZ: db.MultiAZ,
+      }))
+    : [];
+
+  data.rdsCount = dbInstances.length;
+
+} catch (err) {
+  console.error("RDS query failed:", err.name || "Error");
+
+  data.rds = null;
+  data.rdsCount = null;
+  data.rdsError = err.name || "UnknownError";
+}
+
 
     // Final response
     data.detectedIssue = detectedIssue;
