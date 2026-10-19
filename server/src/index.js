@@ -15,7 +15,7 @@ import { CloudWatchClient, ListMetricsCommand, GetMetricStatisticsCommand } from
 import { CloudWatchLogsClient, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
 import { CloudTrailClient, DescribeTrailsCommand, LookupEventsCommand } from "@aws-sdk/client-cloudtrail";
 import { GuardDutyClient, ListDetectorsCommand, GetDetectorCommand,ListFindingsCommand } from "@aws-sdk/client-guardduty";
-import { S3Client, ListBucketsCommand } from "@aws-sdk/client-s3";
+import { S3Client, ListBucketsCommand,GetPublicAccessBlockCommand, } from "@aws-sdk/client-s3";
 import { IAMClient, GetUserCommand } from "@aws-sdk/client-iam";
 import { AutoScalingClient, DescribeAutoScalingGroupsCommand } from "@aws-sdk/client-auto-scaling";
 import { RDSClient, DescribeDBInstancesCommand } from "@aws-sdk/client-rds";
@@ -271,7 +271,59 @@ try {
 });
 
 
+function detectSecurityIssues(securityGroups, s3Findings) {
+  const alerts = [];
 
+  // Rule 1: SSH or RDP exposed to all IPv4 addresses
+  for (const group of securityGroups || []) {
+    for (const rule of group.IpPermissions || []) {
+      const ports = [22, 3389];
+      const exposedPorts = ports.filter(
+        (port) =>
+          (rule.FromPort ?? 0) <= port &&
+          (rule.ToPort ?? 65535) >= port
+      );
+
+      const openToWorld = (rule.IpRanges || []).some(
+        (range) => range.CidrIp === "0.0.0.0/0"
+      );
+
+      if (openToWorld && exposedPorts.length > 0) {
+        alerts.push({
+          id: `sg-${group.GroupId}-${exposedPorts.join("-")}`,
+          service: "EC2 / VPC",
+          resourceId: group.GroupId,
+          severity: "HIGH",
+          title: "Remote administration exposed to the internet",
+          evidence: `Inbound port(s) ${exposedPorts.join(", ")} allow connections from 0.0.0.0/0.`,
+          recommendation:
+            "Restrict inbound access to an approved IP range and review whether remote access is required.",
+          status: "OPEN",
+        });
+      }
+    }
+  }
+
+  // Rule 2: S3 public-access protection is not fully enabled
+  for (const finding of s3Findings || []) {
+    if (finding.publicAccessBlock === false) {
+      alerts.push({
+        id: `s3-${finding.bucketName}-public-access`,
+        service: "S3",
+        resourceId: finding.bucketName,
+        severity: "MEDIUM",
+        title: "S3 public-access protection is incomplete",
+        evidence:
+          "The bucket's Block Public Access configuration is missing or could not be confirmed as enabled.",
+        recommendation:
+          "Review the bucket's public-access requirements and enable all four Block Public Access settings where appropriate.",
+        status: "OPEN",
+      });
+    }
+  }
+
+  return alerts;
+}
 
 // -------------------------------------------------------------------------
 // STEP 4 — Fetch Live Data
@@ -312,7 +364,9 @@ app.post("/api/aws/fetch-data", async (req, res) => {
       const sgData = await ec2.send(
         new DescribeSecurityGroupsCommand({})
       );
-      data.securityGroups = sgData.SecurityGroups?.length || 0;
+      const securityGroups = sgData.SecurityGroups || [];
+      data.securityGroups = securityGroups.length;
+      data.securityGroupDetails = securityGroups;
 
       const instanceSummaries = [];
       data.cpuHistory = [];
@@ -495,14 +549,71 @@ app.post("/api/aws/fetch-data", async (req, res) => {
     }
 
     // S3
+    // S3: bucket inventory and Block Public Access checks
+try {
+  const s3 = new S3Client({ region, credentials });
+
+  const bucketsResult = await s3.send(
+    new ListBucketsCommand({})
+  );
+
+  const buckets = bucketsResult.Buckets || [];
+  data.s3Buckets = buckets.length;
+  data.s3Findings = [];
+
+  for (const bucket of buckets) {
+    const bucketName = bucket.Name;
+
+    if (!bucketName) continue;
+
     try {
-      const s3 = new S3Client({ region, credentials });
-      const buckets = await s3.send(new ListBucketsCommand({}));
-      data.s3Buckets = buckets.Buckets?.length || 0;
+      const result = await s3.send(
+        new GetPublicAccessBlockCommand({
+          Bucket: bucketName,
+        })
+      );
+
+      const config = result.PublicAccessBlockConfiguration;
+
+      const allEnabled =
+        config?.BlockPublicAcls === true &&
+        config?.IgnorePublicAcls === true &&
+        config?.BlockPublicPolicy === true &&
+        config?.RestrictPublicBuckets === true;
+
+      data.s3Findings.push({
+        bucketName,
+        publicAccessBlock: !allEnabled,
+      });
     } catch (err) {
-      console.error("S3 query failed:", err.name || "Error");
-      data.s3Buckets = null;
+      if (
+        err.name === "NoSuchPublicAccessBlockConfiguration"
+      ) {
+        // No bucket-level Block Public Access configuration exists.
+        data.s3Findings.push({
+          bucketName,
+          publicAccessBlock: false,
+        });
+      } else {
+        // Permission errors and other failures are unknown,
+        // not proof that the bucket is publicly exposed.
+        console.warn(
+          `S3 access check unavailable for ${bucketName}:`,
+          err.name || "Error"
+        );
+
+        data.s3Findings.push({
+          bucketName,
+          publicAccessBlock: null,
+        });
+      }
     }
+  }
+} catch (err) {
+  console.error("S3 query failed:", err.name || "Error");
+  data.s3Buckets = null;
+  data.s3Findings = [];
+}
 
     // Auto Scaling
     try {
@@ -536,11 +647,16 @@ app.post("/api/aws/fetch-data", async (req, res) => {
 
     // Final response
     data.detectedIssue = detectedIssue;
+    data.securityAlerts = detectSecurityIssues(
+      data.securityGroupDetails || [],
+      data.s3Findings || []
+    );
 
     console.log("FETCH DATA SUCCESS", {
       ec2Total: data.ec2Total,
       s3Buckets: data.s3Buckets,
       detectedIssue: data.detectedIssue?.type || null,
+      securityAlerts: data.securityAlerts,
     });
 
     return res.json({ data });

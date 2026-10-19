@@ -1269,6 +1269,70 @@ function ReportPanel({ report }) {
   );
 }
 
+function SecurityAlertsPanel({ fetchedData, connection }) {
+  const alerts = fetchedData?.securityAlerts;
+  const isLive = connection?.mode === "live";
+
+  return (
+    <section className="security-alerts-panel">
+      <h2>Security Findings</h2>
+
+      {!isLive ? (
+        <p>Connect to live AWS data to view verified security findings.</p>
+      ) : !Array.isArray(alerts) ? (
+        <p>Security findings are unavailable. Refresh AWS data.</p>
+      ) : alerts.length === 0 ? (
+        <p>No security findings returned by the latest check.</p>
+      ) : (
+        <>
+          <p>
+            {alerts.length} finding(s) detected
+          </p>
+
+          {alerts.map((alert) => (
+            <article
+              key={alert.id}
+              className="security-alert-card"
+            >
+              <h3>{alert.title}</h3>
+
+              <p>
+                <strong>Severity:</strong>{" "}
+                {alert.severity}
+              </p>
+
+              <p>
+                <strong>Service:</strong>{" "}
+                {alert.service}
+              </p>
+
+              <p>
+                <strong>Resource:</strong>{" "}
+                {alert.resourceId}
+              </p>
+
+              <p>
+                <strong>Evidence:</strong>{" "}
+                {alert.evidence}
+              </p>
+
+              <p>
+                <strong>Recommendation:</strong>{" "}
+                {alert.recommendation}
+              </p>
+
+              <p>
+                <strong>Status:</strong>{" "}
+                {alert.status}
+              </p>
+            </article>
+          ))}
+        </>
+      )}
+    </section>
+  );
+}
+
 function AgentPipelineSection({ agentStates, report, running, start, awsMode, autoStart, awaitingConfirmation, onConfirmationResponse, apiAvailable }) {
   const dataSourceIsLive = awsMode === "connected";
   const buttonLabel = running ? "Pipeline running…" : report ? "Run New Incident" : "Run Pipeline";
@@ -2014,6 +2078,10 @@ function OperationsConsole({ form, scenarioKey, onLogout }) {
               <MetricCard icon={ScrollText} label="CloudWatch Logs" value={fetchedData.cwLogs} sub="last 24h" live={connection.mode === "live"} />
               <MetricCard icon={History} label="CloudTrail Events" value={fetchedData.ctEvents} sub="last 24h" live={connection.mode === "live"} />
             </div>
+            <SecurityAlertsPanel
+              fetchedData={fetchedData}
+              connection={connection}
+            />
             {/* ADD THE GRAPH HERE */}
             <CpuHistoryChart
               data={fetchedData.cpuHistory}
