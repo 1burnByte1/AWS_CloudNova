@@ -10,6 +10,8 @@ import {
   DescribeSecurityGroupsCommand,
   RebootInstancesCommand,
   StartInstancesCommand,
+  AuthorizeSecurityGroupIngressCommand,
+  RevokeSecurityGroupIngressCommand,
 } from "@aws-sdk/client-ec2";
 import { CloudWatchClient, ListMetricsCommand, GetMetricStatisticsCommand } from "@aws-sdk/client-cloudwatch";
 import { CloudWatchLogsClient, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
@@ -278,21 +280,24 @@ function detectSecurityIssues(securityGroups, s3Findings) {
   for (const group of securityGroups || []) {
     for (const rule of group.IpPermissions || []) {
       const ports = [22, 3389];
+
       const exposedPorts = ports.filter(
         (port) =>
           (rule.FromPort ?? 0) <= port &&
           (rule.ToPort ?? 65535) >= port
       );
 
-      const openToWorld = (rule.IpRanges || []).some(
+      const exposedRanges = (rule.IpRanges || []).filter(
         (range) => range.CidrIp === "0.0.0.0/0"
       );
 
-      if (openToWorld && exposedPorts.length > 0) {
+      if (exposedRanges.length > 0 && exposedPorts.length > 0) {
         alerts.push({
           id: `sg-${group.GroupId}-${exposedPorts.join("-")}`,
           service: "EC2 / VPC",
           resourceId: group.GroupId,
+          groupId: group.GroupId,
+          exposedPorts,
           severity: "HIGH",
           title: "Remote administration exposed to the internet",
           evidence: `Inbound port(s) ${exposedPorts.join(", ")} allow connections from 0.0.0.0/0.`,
@@ -338,6 +343,7 @@ app.post("/api/aws/fetch-data", async (req, res) => {
 
     // EC2: instances, security groups and CPU metrics
     try {
+      data.cpuHistoryByInstance = {};
       const ec2 = new EC2Client({ region, credentials });
       const instancesData = await ec2.send(
         new DescribeInstancesCommand({})
@@ -368,9 +374,13 @@ app.post("/api/aws/fetch-data", async (req, res) => {
       data.securityGroups = securityGroups.length;
       data.securityGroupDetails = securityGroups;
 
+
       const instanceSummaries = [];
       data.cpuHistory = [];
       data.cpuInstanceId = null;
+
+
+      const CPU_ALERT_THRESHOLD = 60;
 
       if (runningInstances.length > 0) {
         const cw = new CloudWatchClient({ region, credentials });
@@ -386,62 +396,71 @@ app.post("/api/aws/fetch-data", async (req, res) => {
 
         data.cpuInstanceId = target.InstanceId;
 
-        try {
-          const metricData = await cw.send(
-            new GetMetricStatisticsCommand({
-              Namespace: "AWS/EC2",
-              MetricName: "CPUUtilization",
-              Dimensions: [
-                {
-                  Name: "InstanceId",
-                  Value: target.InstanceId,
-                },
-              ],
-              StartTime: start,
-              EndTime: now,
-              Period: 300,
-              Statistics: ["Average"],
-            })
-          );
+        for (const inst of runningInstances) {
+          let history = [];
+          let latest = null;
 
-          data.cpuHistory = (metricData.Datapoints || [])
-            .filter((p) => p.Timestamp && p.Average != null)
-            .sort(
-              (a, b) =>
-                new Date(a.Timestamp) - new Date(b.Timestamp)
-            )
-            .map((p) => ({
-              timestamp: p.Timestamp,
-              cpu: Number(p.Average.toFixed(2)),
-            }));
-        } catch (err) {
-          console.error(
-            "CloudWatch CPU query failed:",
-            err.name || "Error"
-          );
-        }
+          try {
+            const metricData = await cw.send(
+              new GetMetricStatisticsCommand({
+                Namespace: "AWS/EC2",
+                MetricName: "CPUUtilization",
+                Dimensions: [
+                  {
+                    Name: "InstanceId",
+                    Value: inst.InstanceId,
+                  },
+                ],
+                StartTime: start,
+                EndTime: now,
+                Period: 300,
+                Statistics: ["Average"],
+              })
+            );
 
-        const latest =
-          data.cpuHistory.length > 0
-            ? data.cpuHistory[data.cpuHistory.length - 1].cpu
-            : null;
+            history = (metricData.Datapoints || [])
+              .filter((p) => p.Timestamp && p.Average != null)
+              .sort(
+                (a, b) =>
+                  new Date(a.Timestamp) - new Date(b.Timestamp)
+              )
+              .map((p) => ({
+                timestamp: p.Timestamp,
+                cpu: Number(p.Average.toFixed(2)),
+              }));
 
-        data.cpu =
-          latest != null
-            ? `${latest.toFixed(1)}%`
-            : "No recent datapoints";
+            if (history.length > 0) {
+              latest = history[history.length - 1].cpu;
+            }
+          } catch (err) {
+            console.error(
+              `CPU query failed for ${inst.InstanceId}:`,
+              err.name || "Error"
+            );
+          }
 
-        for (const inst of runningInstances.slice(0, 10)) {
+          if (!data.cpuHistoryByInstance) {
+  data.cpuHistoryByInstance = {};
+}
+
+data.cpuHistoryByInstance[inst.InstanceId] = history;
+
           instanceSummaries.push({
             id: inst.InstanceId,
             name: nameOf(inst),
-            state: inst.State?.Name,
-            cpu:
-              inst.InstanceId === target.InstanceId
-                ? latest
-                : null,
+            state: "running",
+            cpu: latest,
           });
         }
+
+        const targetSummary = instanceSummaries.find(
+          (i) => i.id === target.InstanceId
+        );
+
+        data.cpu =
+          targetSummary && targetSummary.cpu != null
+            ? `${targetSummary.cpu.toFixed(1)}%`
+            : "No recent datapoints";
       } else {
         data.cpu = "No running instances";
       }
@@ -456,10 +475,9 @@ app.post("/api/aws/fetch-data", async (req, res) => {
       }
 
       data.instances = instanceSummaries;
+
       data.memory =
         "Requires CloudWatch Agent (not available via base EC2 metrics)";
-
-      const CPU_ALERT_THRESHOLD = 75;
 
       const highCpu = instanceSummaries.find(
         (i) =>
@@ -471,6 +489,29 @@ app.post("/api/aws/fetch-data", async (req, res) => {
       const stopped = instanceSummaries.find(
         (i) => i.state === "stopped"
       );
+
+      if (highCpu) {
+        detectedIssue = {
+          type: "high_cpu",
+          instanceId: highCpu.id,
+          instanceName: highCpu.name,
+          cpu: highCpu.cpu,
+          threshold: CPU_ALERT_THRESHOLD,
+        };
+      } else if (stopped) {
+        detectedIssue = {
+          type: "stopped",
+          instanceId: stopped.id,
+          instanceName: stopped.name,
+        };
+      }
+
+
+      data.instances = instanceSummaries;
+      data.memory =
+        "Requires CloudWatch Agent (not available via base EC2 metrics)";
+
+
 
       if (highCpu) {
         detectedIssue = {
@@ -736,45 +777,220 @@ try {
 // confirm:true, which only happens after a human clicks "Confirm & Execute"
 // in the Remediation Agent card.
 // -------------------------------------------------------------------------
-const SUPPORTED_ACTIONS = new Set(["reboot_instance", "start_instance"]);
+const SUPPORTED_ACTIONS = new Set([
+  "reboot_instance",
+  "start_instance",
+  "restrict_security_group",
+]);
+
 
 app.post("/api/aws/remediate", async (req, res) => {
   const { credentials, region } = resolveCredentials(req.body);
-  const { instanceId, action, confirm } = req.body || {};
+  const {
+    instanceId,
+    action,
+    confirm,
+    groupId,
+    port,
+    approvedCidr,
+  } = req.body || {};
 
   if (!SUPPORTED_ACTIONS.has(action)) {
-    return res.status(400).json({ success: false, message: `Unsupported action: ${action}` });
-  }
-  if (!instanceId) {
-    return res.status(400).json({ success: false, message: "instanceId is required." });
-  }
-
-  const cliVerb = action === "start_instance" ? "start-instances" : "reboot-instances";
-  const cliPreview = `aws ec2 ${cliVerb} --instance-ids ${instanceId} --region ${region || "us-east-1"}`;
-
-  if (!confirm) {
-    return res.json({ success: true, executed: false, cliPreview, message: "Preview only — resend with confirm:true to execute." });
+    return res.status(400).json({
+      success: false,
+      message: `Unsupported action: ${action}`,
+    });
   }
 
   try {
     const ec2 = new EC2Client({ region, credentials });
-    if (action === "start_instance") {
-      await ec2.send(new StartInstancesCommand({ InstanceIds: [instanceId] }));
-      res.json({ success: true, executed: true, cliPreview, message: `Start issued for ${instanceId}.` });
-    } else {
-      await ec2.send(new RebootInstancesCommand({ InstanceIds: [instanceId] }));
-      res.json({ success: true, executed: true, cliPreview, message: `Reboot issued for ${instanceId}.` });
+
+    // Existing EC2 actions — preserved
+    if (action === "start_instance" || action === "reboot_instance") {
+      if (!instanceId) {
+        return res.status(400).json({
+          success: false,
+          message: "instanceId is required.",
+        });
+      }
+
+      const cliVerb =
+        action === "start_instance" ? "start-instances" : "reboot-instances";
+
+      const cliPreview =
+        `aws ec2 ${cliVerb} --instance-ids ${instanceId} --region ${region || "us-east-1"}`;
+
+      if (!confirm) {
+        return res.json({
+          success: true,
+          executed: false,
+          cliPreview,
+          message: "Preview only — resend with confirm:true to execute.",
+        });
+      }
+
+      if (action === "start_instance") {
+        await ec2.send(
+          new StartInstancesCommand({ InstanceIds: [instanceId] })
+        );
+      } else {
+        await ec2.send(
+          new RebootInstancesCommand({ InstanceIds: [instanceId] })
+        );
+      }
+
+      return res.json({
+        success: true,
+        executed: true,
+        verified: false,
+        cliPreview,
+        message: `${action} request issued for ${instanceId}. Check the instance state in AWS.`,
+      });
+    }
+
+    // Security-group remediation
+    if (action === "restrict_security_group") {
+      if (
+        !groupId ||
+        ![22, 3389].includes(Number(port)) ||
+        approvedCidr !== "0.0.0.0/0"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Provide groupId, port 22 or 3389, and approvedCidr 0.0.0.0/0.",
+        });
+      }
+
+      const describe = () =>
+        ec2.send(
+          new DescribeSecurityGroupsCommand({
+            GroupIds: [groupId],
+          })
+        );
+
+      const response = await describe();
+      const group = response.SecurityGroups?.[0];
+
+      if (!group) {
+        return res.status(404).json({
+          success: false,
+          message: `Security group ${groupId} was not found.`,
+        });
+      }
+
+      // Find only the exact public rule covering the approved port.
+
+// Match only a rule whose port range is exactly the requested port.
+// Do not automatically modify broad ranges such as 0-65535.
+const matchingRules = (group.IpPermissions || []).filter((rule) => {
+  const exactPort =
+    rule.FromPort === Number(port) &&
+    rule.ToPort === Number(port);
+
+  const hasPublicRange = (rule.IpRanges || []).some(
+    (range) => range.CidrIp === approvedCidr
+  );
+
+  return exactPort && hasPublicRange;
+});
+
+if (matchingRules.length === 0) {
+  return res.json({
+    success: true,
+    executed: false,
+    verified: true,
+    message:
+      `No exact public inbound rule for port ${port} was found in ${groupId}. No changes made; inspect the current AWS rule.`,
+  });
+}
+
+if (matchingRules.length > 1) {
+  return res.status(409).json({
+    success: false,
+    message:
+      "Multiple matching rules were found. No changes made; inspect the security group in AWS first.",
+  });
+}
+
+const rule = matchingRules[0];
+
+      const exactRanges = (rule.IpRanges || []).filter(
+        (range) => range.CidrIp === approvedCidr
+      );
+
+      // Preserve other CIDRs and IPv6 ranges by removing only the
+      // approved public IPv4 range from the matching permission.
+     const permissionToRevoke = {
+  IpProtocol: rule.IpProtocol,
+  FromPort: rule.FromPort,
+  ToPort: rule.ToPort,
+  IpRanges: exactRanges,
+};
+
+      const cliPreview =
+        `aws ec2 revoke-security-group-ingress --group-id ${groupId} --protocol ${rule.IpProtocol} --port ${port} --cidr ${approvedCidr} --region ${region || "us-east-1"}`;
+
+      if (!confirm) {
+        return res.json({
+          success: true,
+          executed: false,
+          verified: false,
+          cliPreview,
+          message:
+            `Preview only: this will remove ${approvedCidr} from the matching inbound permission in ${groupId}. Review the rule in AWS before approving.`,
+          target: {
+            groupId,
+            port: Number(port),
+            cidr: approvedCidr,
+            protocol: rule.IpProtocol,
+          },
+        });
+      }
+
+      await ec2.send(
+        new RevokeSecurityGroupIngressCommand({
+          GroupId: groupId,
+          IpPermissions: [permissionToRevoke],
+        })
+      );
+
+      // Re-fetch AWS state to verify the public rule was removed.
+      const verifiedResponse = await describe();
+      const verifiedGroup = verifiedResponse.SecurityGroups?.[0];
+
+      const stillExposed = (verifiedGroup?.IpPermissions || []).some((current) => {
+        const coversPort =
+          (current.FromPort ?? 0) <= Number(port) &&
+          (current.ToPort ?? 65535) >= Number(port);
+
+        const hasPublicRange = (current.IpRanges || []).some(
+          (range) => range.CidrIp === approvedCidr
+        );
+
+        return coversPort && hasPublicRange;
+      });
+
+      return res.json({
+        success: !stillExposed,
+        executed: true,
+        verified: !stillExposed,
+        cliPreview,
+        message: stillExposed
+          ? "The change was submitted, but verification found a matching public rule still present."
+          : `Verified in AWS: port ${port} is no longer exposed to ${approvedCidr} in ${groupId}.`,
+      });
     }
   } catch (err) {
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       executed: false,
-      cliPreview,
       reasonCode: mapAwsError(err),
       message: err.message,
     });
   }
 });
+
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {

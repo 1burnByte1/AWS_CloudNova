@@ -67,7 +67,7 @@ const delay = (ms) => new Promise((res) => setTimeout(res, ms));
 // frontend demo, unchanged.
 const API_BASE = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_API_BASE_URL) || "";
 console.log("API_BASE =", API_BASE);
-async function callBackend(path, body, timeoutMs = 15000) {
+async function callBackend(path, body, timeoutMs = 60000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -1430,24 +1430,51 @@ function MetricCard({ icon: Icon, label, value, sub, live }) {
 }
 
 
-function CpuHistoryChart({ data, instanceId, live }) {
-  const points = Array.isArray(data) ? data : [];
+
+function CpuHistoryChart({ data, instances, live }) {
+  const histories =
+    data && typeof data === "object" && !Array.isArray(data)
+      ? data
+      : {};
+
+  const instanceList = Array.isArray(instances) ? instances : [];
+
+  const colors = [
+    "#a78bfa",
+    "#34d399",
+    "#60a5fa",
+    "#fbbf24",
+    "#fb7185",
+    "#22d3ee",
+    "#c084fc",
+    "#a3e635",
+    "#f97316",
+    "#e879f9",
+  ];
+
+  const charts = Object.entries(histories)
+    .map(([id, points]) => ({
+      id,
+      name: instanceList.find((i) => i.id === id)?.name || id,
+      points: Array.isArray(points) ? points : [],
+    }))
+    .filter((item) => item.points.length > 0);
 
   if (!live) {
     return (
-      <div className="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/50 p-5">
+      <section className="mt-6 rounded-xl border border-zinc-800 bg-zinc-900/50 p-5">
         <h2 className="text-sm font-semibold text-zinc-100">
           EC2 CPU Utilization
         </h2>
         <p className="mt-3 text-sm text-amber-300">
           Demo mode — live CPU history is unavailable.
         </p>
-      </div>
+      </section>
     );
   }
 
   const width = 700;
-  const height = 240;
+  const height = 260;
   const left = 48;
   const right = 18;
   const top = 22;
@@ -1455,23 +1482,31 @@ function CpuHistoryChart({ data, instanceId, live }) {
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
 
-  const x = (i) =>
-    points.length < 2
-      ? left + plotWidth / 2
-      : left + (i / (points.length - 1)) * plotWidth;
+  const allPoints = charts.flatMap((chart) => chart.points);
 
-  // Keep a small minimum range so low CPU values remain visible.
   const maxCpu = Math.max(
     1,
-    ...points.map((p) => Number(p.cpu) || 0)
+    ...allPoints.map((point) => Number(point.cpu) || 0)
   );
-  const yMax = Math.min(100, Math.ceil(maxCpu * 1.25));
+
+  const yMax = Math.min(100, Math.max(1, Math.ceil(maxCpu * 1.25)));
+
+  const timestamps = [
+    ...new Set(
+      allPoints.map((point) => new Date(point.timestamp).getTime())
+    ),
+  ].sort((a, b) => a - b);
+
+  const x = (timestamp) =>
+    timestamps.length < 2
+      ? left + plotWidth / 2
+      : left +
+        ((new Date(timestamp).getTime() - timestamps[0]) /
+          (timestamps[timestamps.length - 1] - timestamps[0])) *
+          plotWidth;
+
   const y = (value) =>
     top + plotHeight - ((Number(value) || 0) / yMax) * plotHeight;
-
-  const line = points
-    .map((p, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(p.cpu)}`)
-    .join(" ");
 
   const formatTime = (timestamp) =>
     new Date(timestamp).toLocaleTimeString([], {
@@ -1487,21 +1522,18 @@ function CpuHistoryChart({ data, instanceId, live }) {
             EC2 CPU Utilization
           </h2>
           <p className="mt-1 text-xs text-zinc-500">
-            AWS CloudWatch · CPUUtilization
+            AWS CloudWatch · CPUUtilization · All instances with data
           </p>
         </div>
+
         <span className="rounded-full border border-emerald-500/30 bg-emerald-400/10 px-2.5 py-1 text-[10px] uppercase tracking-widest text-emerald-300">
           Live AWS
         </span>
       </div>
 
-      <p className="mt-3 break-all font-mono text-xs text-zinc-400">
-        Instance: {instanceId || "Not available"}
-      </p>
-
-      {points.length === 0 ? (
+      {charts.length === 0 ? (
         <p className="py-10 text-center text-sm text-zinc-400">
-          No recent CloudWatch CPU datapoints. Refresh the AWS data and try again.
+          No recent CPU datapoints. Fetch AWS data again and wait for CloudWatch metrics.
         </p>
       ) : (
         <>
@@ -1509,12 +1541,13 @@ function CpuHistoryChart({ data, instanceId, live }) {
             <svg
               viewBox={`0 0 ${width} ${height}`}
               role="img"
-              aria-label="CPU utilization over time from AWS CloudWatch"
+              aria-label="CPU utilization over time for multiple EC2 instances"
               className="w-full min-w-[320px]"
             >
               {[0, 0.25, 0.5, 0.75, 1].map((fraction) => {
                 const value = yMax * fraction;
                 const gridY = y(value);
+
                 return (
                   <g key={fraction}>
                     <line
@@ -1538,59 +1571,108 @@ function CpuHistoryChart({ data, instanceId, live }) {
                 );
               })}
 
-              {points.length > 1 && (
-                <path
-                  d={line}
-                  fill="none"
-                  stroke="#a78bfa"
-                  strokeWidth="2.5"
-                  strokeLinejoin="round"
-                  strokeLinecap="round"
-                />
-              )}
+              {charts.map((chart, chartIndex) => {
+                const color = colors[chartIndex % colors.length];
 
-              {points.map((point, i) => (
-                <g key={`${point.timestamp}-${i}`}>
-                  <circle
-                    cx={x(i)}
-                    cy={y(point.cpu)}
-                    r="4"
-                    fill="#a78bfa"
-                    stroke="#18181b"
-                    strokeWidth="2"
-                  >
-                    <title>
-                      {formatTime(point.timestamp)} — {point.cpu}% CPU
-                    </title>
-                  </circle>
-                  <text
-                    x={x(i)}
-                    y={height - 17}
-                    fill="#a1a1aa"
-                    fontSize="10"
-                    textAnchor="middle"
-                  >
-                    {formatTime(point.timestamp)}
-                  </text>
-                </g>
+                const points = chart.points
+                  .slice()
+                  .sort(
+                    (a, b) =>
+                      new Date(a.timestamp) - new Date(b.timestamp)
+                  );
+
+                const line = points
+                  .map(
+                    (point, index) =>
+                      `${index === 0 ? "M" : "L"} ${x(point.timestamp)} ${y(point.cpu)}`
+                  )
+                  .join(" ");
+
+                return (
+                  <g key={chart.id}>
+                    {points.length > 1 && (
+                      <path
+                        d={line}
+                        fill="none"
+                        stroke={color}
+                        strokeWidth="2.5"
+                        strokeLinejoin="round"
+                        strokeLinecap="round"
+                      />
+                    )}
+
+                    {points.map((point, index) => (
+                      <circle
+                        key={`${chart.id}-${point.timestamp}-${index}`}
+                        cx={x(point.timestamp)}
+                        cy={y(point.cpu)}
+                        r="3"
+                        fill={color}
+                      >
+                        <title>
+                          {chart.name} — {formatTime(point.timestamp)} — {point.cpu}% CPU
+                        </title>
+                      </circle>
+                    ))}
+                  </g>
+                );
+              })}
+
+              {timestamps.map((timestamp) => (
+                <text
+                  key={timestamp}
+                  x={x(timestamp)}
+                  y={height - 17}
+                  fill="#a1a1aa"
+                  fontSize="10"
+                  textAnchor="middle"
+                >
+                  {formatTime(timestamp)}
+                </text>
               ))}
             </svg>
           </div>
 
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-zinc-800 pt-3">
-            <p className="text-xs text-zinc-500">
-              {points.length} CloudWatch datapoint
-              {points.length === 1 ? "" : "s"} · 5-minute period
-            </p>
-            <p className="text-sm font-semibold text-violet-300">
-              Latest: {Number(points[points.length - 1].cpu).toFixed(2)}%
-            </p>
+          <div className="mt-4 flex flex-wrap gap-x-5 gap-y-3 border-t border-zinc-800 pt-4">
+            {charts.map((chart, index) => {
+              const latest = chart.points
+                .slice()
+                .sort(
+                  (a, b) =>
+                    new Date(a.timestamp) - new Date(b.timestamp)
+                )
+                .at(-1);
+
+              return (
+                <div key={chart.id} className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="h-2.5 w-2.5 shrink-0 rounded-full"
+                      style={{
+                        backgroundColor: colors[index % colors.length],
+                      }}
+                    />
+                    <span className="break-all text-xs text-zinc-300">
+                      {chart.name}
+                    </span>
+                  </div>
+                  <p className="ml-4 mt-1 text-sm font-semibold text-zinc-100">
+                    {latest ? `${Number(latest.cpu).toFixed(2)}%` : "N/A"}
+                  </p>
+                </div>
+              );
+            })}
           </div>
+
+          <p className="mt-3 text-xs text-zinc-500">
+            {charts.length} instance{charts.length === 1 ? "" : "s"} with CPU data · 5-minute CloudWatch periods
+          </p>
         </>
       )}
     </section>
   );
 }
+
 
 
 function CloudTrailActivity({ events, live }) {
@@ -2080,15 +2162,18 @@ function OperationsConsole({ form, scenarioKey, onLogout }) {
               <MetricCard icon={History} label="CloudTrail Events" value={fetchedData.ctEvents} sub="last 24h" live={connection.mode === "live"} />
             </div>
             <SecurityAlertsPanel
-              fetchedData={fetchedData}
-              connection={connection}
-            />
+  fetchedData={fetchedData}
+  connection={connection}
+  credentials={ENV_CREDENTIALS}
+  apiBase={API_BASE}
+/>
             {/* ADD THE GRAPH HERE */}
             <CpuHistoryChart
-              data={fetchedData.cpuHistory}
-              instanceId={fetchedData.cpuInstanceId}
-              live={connection.mode === "live" && backendVerified}
+            data={fetchedData.cpuHistoryByInstance}
+            instances={fetchedData.instances}
+            live={connection.mode === "live" && backendVerified}
             />
+
             <CloudTrailActivity
             events={fetchedData.ctEventDetails}
             live={connection.mode === "live" && backendVerified}
@@ -2131,3 +2216,4 @@ export default function CloudNovaApp() {
 
   return <OperationsConsole key={consoleKey} form={form} scenarioKey={scenarioKey} onLogout={handleLogout} />;
 }
+//line 2219
